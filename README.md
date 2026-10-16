@@ -407,6 +407,10 @@ variant) exposes `exl3_moe` (35-arg v1.5 signature) / `exl3_moe_gather` /
 `exl3_moe_max_concurrency`; upstream's aarch64 guard (181eea1) is applied by
 `overlay/patch_exl3_ext_aarch64.py`. `EXL3_MOE_FUSED_DET=1` (default) replaces
 the atomic routed-expert combine with per-slot fp32 storage and a fixed-order sum.
+`VLLM_GLM5NEXT_DETERMINISTIC_TOPK=1` (default, `overlay/patch_kpool_deterministic_topk.py`)
+makes the kpool indexer's pool top-k exact and canonical (ties to the lowest pool id,
+ids ascending), so prompts past 2048 tokens select the same keys in the same order on
+every run.
 
 ## Abliteration (`ABLIT=1`)
 

@@ -452,7 +452,8 @@ RUN set -eux; \
 ENV EXL3_MOE_FUSED_DET=1 \
     EXL3_NO_FUSED_RECONSTRUCT=1 \
     EXL3_HGEMM_F16ACC=0 \
-    EXL3_INT8_GEMV=0
+    EXL3_INT8_GEMV=0 \
+    VLLM_GLM5NEXT_DETERMINISTIC_TOPK=1
 
 # Keep this AFTER the CUDA compile layer so Python-only hook edits do not
 # rebuild exllamav3_ext. Exl3Config.override_quantization_method requires
@@ -486,12 +487,12 @@ COPY overlay/patch_cache_reset.py /opt/glm53/patch_cache_reset.py
 COPY tests/test_cache_reset_endpoint.py /opt/glm53/test_cache_reset_endpoint.py
 # Keep both kpool patchers in one layer: #280's separate COPY/RUN steps push
 # this recipe past overlay2's runnable layer depth on the two-node hosts.
-COPY overlay/patch_kpool_tail_slotmap.py overlay/patch_kpool_tail_seed_stride.py /opt/glm53/
+COPY overlay/patch_kpool_tail_slotmap.py overlay/patch_kpool_tail_seed_stride.py overlay/patch_kpool_deterministic_topk.py /opt/glm53/
 COPY overlay/patch_mamba_align_state_free.py /opt/glm53/patch_mamba_align_state_free.py
 COPY overlay/patch_mamba_align_chunking.py /opt/glm53/patch_mamba_align_chunking.py
 COPY tests/test_mamba_align_state_free.py /opt/glm53/test_mamba_align_state_free.py
 COPY tests/test_mamba_align_chunking.py /opt/glm53/test_mamba_align_chunking.py
-COPY tests/test_kpool_tail_slotmap.py tests/test_kpool_tail_seed_stride.py /opt/glm53/
+COPY tests/test_kpool_tail_slotmap.py tests/test_kpool_tail_seed_stride.py tests/test_kpool_deterministic_topk.py /opt/glm53/
 COPY overlay/patch_spinwait.py /opt/glm53/patch_spinwait.py
 COPY tests/test_spinwait_patch.py /opt/glm53/test_spinwait_patch.py
 COPY overlay/patch_indexer_workspace.py /opt/glm53/patch_indexer_workspace.py
@@ -499,7 +500,7 @@ COPY tests/test_indexer_workspace.py /opt/glm53/test_indexer_workspace.py
 COPY overlay/patch_tool_choice_none.py /opt/glm53/patch_tool_choice_none.py
 COPY overlay/patch_loadclone.py /opt/glm53/patch_loadclone.py
 COPY tests/test_loadclone.py /opt/glm53/test_loadclone.py
-COPY tests/fixtures/loadclone_weight_utils.py.txt tests/fixtures/kpool_tail_seed_kernel-487ecf187.py.txt tests/fixtures/kpool_tail_seed_kernel-db1bfdd.py.txt /opt/glm53/fixtures/
+COPY tests/fixtures/loadclone_weight_utils.py.txt tests/fixtures/kpool_tail_seed_kernel-487ecf187.py.txt tests/fixtures/kpool_tail_seed_kernel-db1bfdd.py.txt tests/fixtures/sparse_attn_indexer_kpool-487ecf187.py.txt /opt/glm53/fixtures/
 COPY tests/test_tool_choice_none.py /opt/glm53/test_tool_choice_none.py
 COPY overlay/ablit_runtime.py /opt/glm53/ablit_runtime.py
 COPY overlay/patch_ablit.py /opt/glm53/patch_ablit.py
@@ -548,9 +549,11 @@ RUN GLM53_KV_CACHE_UTILS_PY=/usr/local/lib/python3.12/dist-packages/vllm/v1/core
     GLM53_REQUIRE_TARGET=1 python3 /opt/glm53/test_kv_capacity_log.py
 RUN python3 /opt/glm53/patch_kv_capacity_log.py
 RUN python3 /opt/glm53/patch_xgrammar_termination.py
-# Apply both independent kpool patches in their original order and one layer.
+# Apply the independent kpool patches in their original order and one layer
+# (the deterministic top-k patch rides the same layer: no new layer depth).
 RUN python3 /opt/glm53/patch_kpool_tail_slotmap.py \
-    && python3 /opt/glm53/patch_kpool_tail_seed_stride.py
+    && python3 /opt/glm53/patch_kpool_tail_seed_stride.py \
+    && python3 /opt/glm53/patch_kpool_deterministic_topk.py
 # Applied unconditionally; the injected sizing reads GLM53_INDEXER_WORKSPACE
 # at runtime and returns the stock expression unless it is "rightsize".
 RUN python3 /opt/glm53/patch_indexer_workspace.py
@@ -571,6 +574,8 @@ RUN EXL3_SELFCHECK_GPU=0 python3 /opt/glm53/test_exl3_overlay.py \
     && python3 /opt/glm53/test_xgrammar_termination.py \
     && python3 /opt/glm53/test_kpool_tail_slotmap.py \
     && python3 /opt/glm53/test_kpool_tail_seed_stride.py \
+    && GLM53_SPARSE_INDEXER_KPOOL_PY=/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer_kpool.py \
+       python3 /opt/glm53/test_kpool_deterministic_topk.py \
     && python3 /opt/glm53/test_spinwait_patch.py \
     && python3 /opt/glm53/test_indexer_workspace.py \
     && python3 /opt/glm53/test_tool_choice_none.py \

@@ -256,6 +256,9 @@ KPOOL_TAIL_PATCH_HOST="${KPOOL_TAIL_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_
 # vLLM #57477. Different file from the slot-map clamp above: kpool_compress.py
 # prefill seed stride, not block_table.py.
 KPOOL_SEED_PATCH_HOST="${KPOOL_SEED_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_tail_seed_stride.py}"
+# Deterministic kpool indexer top-k (VLLM_GLM5NEXT_DETERMINISTIC_TOPK, image default 1;
+# override per run with GLM53_EXTRA_ENV="VLLM_GLM5NEXT_DETERMINISTIC_TOPK=0").
+DET_TOPK_PATCH_HOST="${DET_TOPK_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_kpool_deterministic_topk.py}"
 MAMBA_STATE_PATCH_HOST="${MAMBA_STATE_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_mamba_align_state_free.py}"
 MAMBA_CHUNK_PATCH_HOST="${MAMBA_CHUNK_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_mamba_align_chunking.py}"
 SPINWAIT_PATCH_HOST="${SPINWAIT_PATCH_HOST:-$SCRIPT_DIR/overlay/patch_spinwait.py}"
@@ -876,6 +879,7 @@ validate_overlay_artifacts() {
         "$XGRAMMAR_PATCH_HOST|vllm/v1/structured_output/|$main_guard"
         "$KPOOL_TAIL_PATCH_HOST|[glm53-kpool-tail-slotmap]|$main_guard"
         "$KPOOL_SEED_PATCH_HOST|[glm53-kpool-tail-seed-stride]|$main_guard"
+        "$DET_TOPK_PATCH_HOST|[glm53-det-topk]|$main_guard"
         "$MAMBA_STATE_PATCH_HOST|[glm53-mamba-align-state-free-v1]|$main_guard"
         "$MAMBA_CHUNK_PATCH_HOST|[glm53-mamba-align-chunking-v1]|$main_guard"
         "$SPINWAIT_PATCH_HOST|device_communicators/shm_broadcast.py|$main_guard"
@@ -1315,6 +1319,7 @@ preflight() {
     [ -f "$SKIP_CGPROF_PATCH_HOST" ] || die "$SKIP_CGPROF_PATCH_HOST missing"
     [ -f "$KPOOL_TAIL_PATCH_HOST" ] || die "$KPOOL_TAIL_PATCH_HOST missing"
     [ -f "$KPOOL_SEED_PATCH_HOST" ] || die "$KPOOL_SEED_PATCH_HOST missing"
+    [ -f "$DET_TOPK_PATCH_HOST" ] || die "$DET_TOPK_PATCH_HOST missing"
     [ -f "$MAMBA_STATE_PATCH_HOST" ] || die "$MAMBA_STATE_PATCH_HOST missing"
     [ -f "$MAMBA_CHUNK_PATCH_HOST" ] || die "$MAMBA_CHUNK_PATCH_HOST missing"
     [ -f "$SPINWAIT_PATCH_HOST" ] || die "$SPINWAIT_PATCH_HOST missing"
@@ -1952,6 +1957,7 @@ GLM53_OVERLAY_ORDER=(
     patch_xgrammar_termination.py
     patch_kpool_tail_slotmap.py
     patch_kpool_tail_seed_stride.py
+    patch_kpool_deterministic_topk.py
     patch_spinwait.py
     patch_adaptive_k.py
     patch_dense_fp8.py
@@ -2273,6 +2279,8 @@ launch_cluster() {
     scp -q -o BatchMode=yes "$KPOOL_TAIL_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kpool_tail_slotmap.py"
     [ -f "$KPOOL_SEED_PATCH_HOST" ] || die "missing $KPOOL_SEED_PATCH_HOST"
     scp -q -o BatchMode=yes "$KPOOL_SEED_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kpool_tail_seed_stride.py"
+    [ -f "$DET_TOPK_PATCH_HOST" ] || die "missing $DET_TOPK_PATCH_HOST"
+    scp -q -o BatchMode=yes "$DET_TOPK_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_kpool_deterministic_topk.py"
     [ -f "$MAMBA_STATE_PATCH_HOST" ] || die "missing $MAMBA_STATE_PATCH_HOST"
     scp -q -o BatchMode=yes "$MAMBA_STATE_PATCH_HOST" "${WORKER_SSH}:/tmp/patch_mamba_align_state_free.py"
     [ -f "$MAMBA_CHUNK_PATCH_HOST" ] || die "missing $MAMBA_CHUNK_PATCH_HOST"
@@ -2503,6 +2511,7 @@ launch_cluster() {
         -v '/tmp/patch_skip_cudagraph_profile.py:/opt/glm53/patch_skip_cudagraph_profile.py:ro' \
         -v '/tmp/patch_kpool_tail_slotmap.py:/opt/glm53/patch_kpool_tail_slotmap.py:ro' \
         -v '/tmp/patch_kpool_tail_seed_stride.py:/opt/glm53/patch_kpool_tail_seed_stride.py:ro' \
+        -v '/tmp/patch_kpool_deterministic_topk.py:/opt/glm53/patch_kpool_deterministic_topk.py:ro' \
         -v '/tmp/patch_mamba_align_state_free.py:/opt/glm53/patch_mamba_align_state_free.py:ro' \
         -v '/tmp/patch_mamba_align_chunking.py:/opt/glm53/patch_mamba_align_chunking.py:ro' \
         -v '/tmp/patch_spinwait.py:/opt/glm53/patch_spinwait.py:ro' \
@@ -2553,6 +2562,7 @@ launch_cluster() {
         -v "$SKIP_CGPROF_PATCH_HOST:/opt/glm53/patch_skip_cudagraph_profile.py:ro" \
         -v "$KPOOL_TAIL_PATCH_HOST:/opt/glm53/patch_kpool_tail_slotmap.py:ro" \
         -v "$KPOOL_SEED_PATCH_HOST:/opt/glm53/patch_kpool_tail_seed_stride.py:ro" \
+        -v "$DET_TOPK_PATCH_HOST:/opt/glm53/patch_kpool_deterministic_topk.py:ro" \
         -v "$MAMBA_STATE_PATCH_HOST:/opt/glm53/patch_mamba_align_state_free.py:ro" \
         -v "$MAMBA_CHUNK_PATCH_HOST:/opt/glm53/patch_mamba_align_chunking.py:ro" \
         -v "$SPINWAIT_PATCH_HOST:/opt/glm53/patch_spinwait.py:ro" \

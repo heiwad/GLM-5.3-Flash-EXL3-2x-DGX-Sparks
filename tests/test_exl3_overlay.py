@@ -408,7 +408,10 @@ def _tiny_layer(device, n_exp: int = 3, hidden: int = 256, inter: int = 256):
 
 def _check_fused_vs_loop(device) -> None:
     import torch
-    from vllm.model_executor.layers.quantization.exl3 import apply_exl3_experts
+    from vllm.model_executor.layers.quantization.exl3 import (
+        apply_exl3_experts,
+        fused_det_enabled,
+    )
 
     method, layer = _tiny_layer(device)
     del method
@@ -418,6 +421,11 @@ def _check_fused_vs_loop(device) -> None:
     y_loop = apply_exl3_experts(x, ids, w, layer, fused=False)
     y_fused = apply_exl3_experts(x, ids, w, layer, fused=True)
     assert layer._exl3_last_apply == "fused", layer._exl3_last_apply
+    if fused_det_enabled():
+        # EXL3_MOE_FUSED_DET: slot + fixed-order gather, so repeats are bit-identical.
+        for _ in range(4):
+            y_again = apply_exl3_experts(x, ids, w, layer, fused=True)
+            assert torch.equal(y_again, y_fused), "fused-det repeat is not bit-identical"
     assert y_loop.shape == y_fused.shape == (2, 256)
     assert torch.isfinite(y_loop).all() and torch.isfinite(y_fused).all()
     err = (y_loop.float() - y_fused.float()).abs()
@@ -1071,6 +1079,9 @@ def _check_grouped_fat(device) -> None:
         os.environ["EXL3_FAT_GROUPED"] = "1"
         e2 = _err_stats(y_loop, y_e2)
         e2_rep = _err_stats(y_e2, y_e2b)
+        if exl3mod.fused_det_enabled():
+            # Thin slots gathered in top-k order, E2 fat experts added in expert order.
+            assert torch.equal(y_e2, y_e2b), ("E2 repeat not bit-identical under EXL3_MOE_FUSED_DET", e2_rep)
         # E3 measured only after E2 statistics (tolerances) are fixed.
         _FAT_GROUPED_CACHE.clear()
         reset_exl3_fat_diag_counters()

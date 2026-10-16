@@ -368,7 +368,13 @@ PY
 
 # EXL3/MCG trellis for routed experts (compiled for SM121, not SM120 cubins).
 # Python overlay (exl3.py) is copied AFTER the CUDA compile so edits do not
-# rebuild exllamav3_ext. The aarch64 stub patch must stay in this layer.
+# rebuild exllamav3_ext. The aarch64 guard patch must stay in this layer.
+#
+# Deterministic variant: exllamav3 v1.5.0 (0740edc), the first release with
+# upstream's deterministic MoE reduction (d5d56bd ordered index_add_, 1c8aff4
+# EXL3_MOE_FUSED_DET slot scratch + exl3_moe_gather, 900cf17 GatedDeltaNet).
+# v1.5.0 does not build on aarch64 by itself; patch_exl3_ext_aarch64.py
+# applies upstream's own aarch64 guard (181eea1, shipped in v1.5.2).
 COPY overlay/patch_exl3_ext_aarch64.py /opt/glm53/patch_exl3_ext_aarch64.py
 COPY overlay/patch_exl3_fat_kernel.py /opt/glm53/patch_exl3_fat_kernel.py
 COPY overlay/patch_exl3_decode_pipeline.py /opt/glm53/patch_exl3_decode_pipeline.py
@@ -377,7 +383,7 @@ COPY overlay/exl3_fat_gemm.cuh /opt/glm53/exl3-fat-kernel/exl3_fat_gemm.cuh
 COPY overlay/exl3_fat_moe.cu /opt/glm53/exl3-fat-kernel/exl3_fat_moe.cu
 COPY overlay/exl3_fat_moe.cuh /opt/glm53/exl3-fat-kernel/exl3_fat_moe.cuh
 
-ARG EXLLAMAV3_COMMIT=c5d9c657966ffeeaa9353f0cc899f18629da4a13
+ARG EXLLAMAV3_COMMIT=0740edc2da569fb99174023c1d2988b1e98cb41e
 ENV TORCH_CUDA_ARCH_LIST=12.1a
 ENV FLASHINFER_CUDA_ARCH_LIST=12.1a
 ENV MAX_JOBS=8
@@ -430,10 +436,23 @@ RUN set -eux; \
     export CPLUS_INCLUDE_PATH="/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"; \
     export C_INCLUDE_PATH="/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"; \
     cd /tmp/exllamav3; \
+    python3 -c "import setuptools, sys; v = tuple(int(x) for x in setuptools.__version__.split('.')[:2]); sys.exit(0 if v >= (77, 0) else 1)" \
+      || pip install --no-deps --no-cache-dir "setuptools>=77,<80"; \
     TORCH_CUDA_ARCH_LIST=12.1a MAX_JOBS=8 \
       pip install --no-deps --no-build-isolation --no-cache-dir .; \
-    python3 -c "import torch; import exllamav3_ext; assert hasattr(exllamav3_ext, 'exl3_moe'), dir(exllamav3_ext); assert hasattr(exllamav3_ext, 'exl3_fat_gemm'), dir(exllamav3_ext); assert hasattr(exllamav3_ext, 'exl3_fat_gemm_scatter'), dir(exllamav3_ext); assert hasattr(exllamav3_ext, 'exl3_fat_moe_gateup'), dir(exllamav3_ext); assert hasattr(exllamav3_ext, 'exl3_fat_moe_down'), dir(exllamav3_ext); assert hasattr(exllamav3_ext, 'exl3_fat_moe_gather'), dir(exllamav3_ext); assert hasattr(exllamav3_ext, 'glm53_fast_moe_version') and exllamav3_ext.glm53_fast_moe_version() == 1; print('exllamav3_ext', exllamav3_ext.__file__, 'exl3_moe=yes fat_gemm=yes fat_moe=yes moe_fast=yes')"; \
+    python3 -c "import torch; import exllamav3_ext; assert hasattr(exllamav3_ext, 'exl3_moe'), dir(exllamav3_ext); assert 'arg34' in (exllamav3_ext.exl3_moe.__doc__ or ''), exllamav3_ext.exl3_moe.__doc__; assert hasattr(exllamav3_ext, 'exl3_moe_gather'), dir(exllamav3_ext); assert hasattr(exllamav3_ext, 'exl3_fat_gemm'), dir(exllamav3_ext); assert hasattr(exllamav3_ext, 'exl3_fat_gemm_scatter'), dir(exllamav3_ext); assert hasattr(exllamav3_ext, 'exl3_fat_moe_gateup'), dir(exllamav3_ext); assert hasattr(exllamav3_ext, 'exl3_fat_moe_down'), dir(exllamav3_ext); assert hasattr(exllamav3_ext, 'exl3_fat_moe_gather'), dir(exllamav3_ext); assert hasattr(exllamav3_ext, 'glm53_fast_moe_version') and exllamav3_ext.glm53_fast_moe_version() == 1; print('exllamav3_ext', exllamav3_ext.__file__, 'exl3_moe=v1.5 moe_gather=yes fat_gemm=yes fat_moe=yes moe_fast=yes')"; \
     rm -rf /tmp/exllamav3 /root/.cache/pip
+
+# Deterministic variant defaults. EXL3_MOE_FUSED_DET=1: slot + fixed-order
+# gather instead of atomics in the routed-expert combine (overlay/exl3.py).
+# The other three keep v1.5's new LinearEXL3 paths (dense EXL3 packs and the
+# sorted/legacy fat tiers only) on the v0.0.43 numerics: no folded-Hadamard
+# reconstruct, cuBLAS instead of the timing-probed fp16-accumulate GEMM (a
+# per-boot rate probe could flip it between boots), no int8-activation GEMV.
+ENV EXL3_MOE_FUSED_DET=1 \
+    EXL3_NO_FUSED_RECONSTRUCT=1 \
+    EXL3_HGEMM_F16ACC=0 \
+    EXL3_INT8_GEMV=0
 
 # Keep this AFTER the CUDA compile layer so Python-only hook edits do not
 # rebuild exllamav3_ext. Exl3Config.override_quantization_method requires

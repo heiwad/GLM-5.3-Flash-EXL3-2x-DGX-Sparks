@@ -3,21 +3,31 @@
 
 Derived from the validated patch in
 coolbho3k/GLM-5.3-Flash-NVFP4-DFlash2-2x-DGX-Spark
-(`vendor/miaai-exl3/patch_exl3_decode_pipeline.py`), applied here to the same
-pinned exllamav3 commit (c5d9c65) used by this repository's Dockerfile.
+(`vendor/miaai-exl3/patch_exl3_decode_pipeline.py`), originally written for
+exllamav3 c5d9c65 (v0.0.43) and ported here to the v1.5.0 kernel layout
+(0740edc) pinned by this variant's Dockerfile. The v1.5 kernel template is
+`<t_bits, MOE_TILESIZE_N, cb, M_TILE>` with a `moe_gemm_tile` helper, a
+runtime `gated` flag and the deterministic slot store (output_scratch /
+fused_base); the copy keeps all of that, so the fast kernel honours
+EXL3_MOE_FUSED_DET exactly like the stock one. NOT re-measured on SM121 after
+the port: it stays opt-in (GLM53_EXL3_MOE_FAST=0 default).
 
 What it does (additive only; the stock `exl3_moe` kernels are untouched):
   * copies `quant/exl3_moe_kernel.cuh` to
     `quant/glm53_exl3_moe_fast_kernel.cuh` with a `bool shared_input`
-    template parameter and the `glm53_exl3_moe_fast_kernel` entry point;
-  * when `shared_input` is true, the redundant gate/up input Hadamard is
-    skipped and the up GEMM reads the already-transformed gate buffer;
+    template parameter, the `glm53_exl3_moe_fast_kernel` entry point and the
+    tile helper renamed `glm53_moe_gemm_tile` (its body reads the stage
+    macros, so it must not share a name with the stock helper);
+  * when `shared_input` is true (and the activation is gated), the redundant
+    up input Hadamard is skipped and the up GEMM reads the already-transformed
+    gate buffer;
   * adds `quant/comp_units/glm53_exl3_moe_fast.cu` instantiating
-    `<4, 256, true/false>` with MOE_FRAG_STAGES 1 / MOE_SH_STAGES 8
-    (stock is 3/3);
-  * host dispatch in `quant/exl3_moe.cu` selects the fast kernel only when
-    K == 4, N_off == 1 (hidden % 256 == intermediate % 256 == 0),
-    `GLM53_EXL3_MOE_FAST=1`, and the device is SM121 (12.1);
+    `<4, 256, cb=1 (mcg), M_TILE=16, true/false>` with MOE_FRAG_STAGES 1 /
+    MOE_SH_STAGES 8 (stock is 3/3);
+  * host dispatch in `quant/exl3_moe.cu` selects the fast kernel only for the
+    16-row launch when K == 4, the codebook is mcg (cb_idx 0), N_off == 1
+    (hidden % 256 == intermediate % 256 == 0), `GLM53_EXL3_MOE_FAST=1`, and the
+    device is SM121 (12.1);
   * `shared_input` is true only when the gate/up SUH pointer tables are the
     identical allocation (aliased in `overlay/exl3.py` after a load-time
     all-expert equality check).
@@ -44,8 +54,15 @@ def patch(root):
     if 'GLM53_EXL3_MOE_FAST' in host:
         raise RuntimeError('Decode pipeline patch already present; use a clean source tree')
     kernel = (quant / 'exl3_moe_kernel.cuh').read_text()
-    kernel = once(kernel, 'template<int t_bits, int MOE_TILESIZE_N>',
-                  'template<int t_bits, int MOE_TILESIZE_N, bool shared_input>')
+    # v1.5 tile helper: rename every use (definition + 6 call sites) so the
+    # copy's helper, which expands MOE_SH_STAGES/MOE_FRAG_STAGES at parse time,
+    # never shares a name with the stock one.
+    n_tile = kernel.count('moe_gemm_tile')
+    if n_tile != 7:
+        raise RuntimeError(f'Expected 7 moe_gemm_tile references, found {n_tile}')
+    kernel = kernel.replace('moe_gemm_tile', 'glm53_moe_gemm_tile')
+    kernel = once(kernel, 'template<int t_bits, int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M>',
+                  'template<int t_bits, int MOE_TILESIZE_N, int cb, int M_TILE, bool shared_input>')
     kernel = once(kernel, 'void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)',
                   'void glm53_exl3_moe_fast_kernel(EXL3_MOE_KERNEL_ARGS)')
     redundant = '''                had_hf_r_128_inner<true, false>
@@ -56,19 +73,20 @@ def patch(root):
                     0.088388347648f
                 );'''
     kernel = once(kernel, redundant,
-                  '                if constexpr (!shared_input) {\n' + redundant + '\n                }')
+                  '                if (!(shared_input && gated)) {\n' + redundant + '\n                }')
     kernel = once(kernel,
                   'gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);',
-                  'gemm_up(shared_input ? temp_state_g : temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);')
+                  'gemm_up((shared_input && gated) ? temp_state_g : temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);')
     wrapper = '''#include "exl3_moe_instances.cuh"
 #undef MOE_FRAG_STAGES
 #define MOE_FRAG_STAGES 1
 #undef MOE_SH_STAGES
 #define MOE_SH_STAGES 8
 #include "../glm53_exl3_moe_fast_kernel.cuh"
+// cb = 1 is the mcg codebook instance (exl3_moe.cu: cb_idx 0 -> *_cb1).
 fp_exl3_moe_kernel glm53_exl3_moe_fast_k4_n256(bool shared_input) {
-    return shared_input ? glm53_exl3_moe_fast_kernel<4, 256, true>
-                        : glm53_exl3_moe_fast_kernel<4, 256, false>;
+    return shared_input ? glm53_exl3_moe_fast_kernel<4, 256, 1, 16, true>
+                        : glm53_exl3_moe_fast_kernel<4, 256, 1, 16, false>;
 }
 '''
     helper = '''
@@ -97,13 +115,12 @@ static bool glm53_fast_moe_enabled(int device) {
 }
 '''
     host = once(host, '#include <set>', '#include <set>\n' + helper)
-    anchor = '    fp_exl3_moe_kernel kernel = exl3_moe_kernel_instances[2 * K + N_off];'
+    anchor = '        kernel = exl3_moe_kernel_instances[4 * K + 2 * cb_idx + N_off];'
     host = once(host, anchor, anchor + '''
-    if (K == 4 && N_off == 1 && glm53_fast_moe_enabled(device)) {
-        kernel = glm53_exl3_moe_fast_k4_n256(
-            gate_ptrs_suh.data_ptr() == up_ptrs_suh.data_ptr());
-    }
-''')
+        if (K == 4 && cb_idx == 0 && N_off == 1 && glm53_fast_moe_enabled(device)) {
+            kernel = glm53_exl3_moe_fast_k4_n256(
+                gate_ptrs_suh.data_ptr() == up_ptrs_suh.data_ptr());
+        }''')
     bindings_path = root / 'bindings.cpp'
     bindings = once(bindings_path.read_text(),
                     '    m.def("exl3_moe", &exl3_moe, "exl3_moe");',

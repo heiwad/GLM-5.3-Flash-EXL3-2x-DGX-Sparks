@@ -44,8 +44,12 @@ def _load_patch_module():
 
 PATCHER = _load_patch_module()
 
-# Fixture mirrors the real pinned-source anchors (indentation included).
-FIXTURE_KERNEL = '''template<int t_bits, int MOE_TILESIZE_N>
+# Fixture mirrors the real pinned-source anchors (exllamav3 v1.5.0,
+# indentation included): the tile helper with its six call sites, the
+# four-parameter kernel template, the up-input Hadamard and the up GEMM.
+FIXTURE_KERNEL = '''template<int t_bits, int cb, int MT, int N_TILE>
+void moe_gemm_tile() {}
+template<int t_bits, int MOE_TILESIZE_N, int cb, int M_TILE = MOE_TILESIZE_M>
 void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS) {
                 had_hf_r_128_inner<true, false>
                 (
@@ -54,11 +58,14 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS) {
                     exp_up_suh + 128 * token_off,
                     0.088388347648f
                 );
-gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
+moe_gemm_tile<t_bits, cb, 64, MOE_TILESIZE_N>(); moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N>();
+moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N>(); moe_gemm_tile<t_bits, cb, 32, MOE_TILESIZE_N>();
+moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N>(); moe_gemm_tile<t_bits, cb, 16, MOE_TILESIZE_N>();
+        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
 }
 '''
 FIXTURE_HOST = ('#include <set>\n'
-                '    fp_exl3_moe_kernel kernel = exl3_moe_kernel_instances[2 * K + N_off];\n')
+                '        kernel = exl3_moe_kernel_instances[4 * K + 2 * cb_idx + N_off];\n')
 FIXTURE_BINDINGS = '    m.def("exl3_moe", &exl3_moe, "exl3_moe");\n'
 
 
@@ -78,6 +85,13 @@ class NativePatchTests(unittest.TestCase):
             self.assertEqual(
                 (root / "quant/exl3_moe_kernel.cuh").read_text(), FIXTURE_KERNEL
             )
+            fast = (root / "quant/glm53_exl3_moe_fast_kernel.cuh").read_text()
+            self.assertNotIn(" moe_gemm_tile", fast.replace("glm53_moe_gemm_tile", ""))
+            self.assertEqual(fast.count("glm53_moe_gemm_tile"), 7)
+            self.assertIn("bool shared_input>", fast)
+            self.assertIn("if (!(shared_input && gated)) {", fast)
+            self.assertIn("glm53_exl3_moe_fast_kernel<4, 256, 1, 16, true>",
+                          (root / "quant/comp_units/glm53_exl3_moe_fast.cu").read_text())
             host = (root / "quant/exl3_moe.cu").read_text()
             # Double apply refuses; host is unchanged by the second attempt.
             with self.assertRaises(RuntimeError):

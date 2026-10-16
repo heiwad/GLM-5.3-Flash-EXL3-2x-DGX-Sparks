@@ -52,8 +52,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-EXLLAMAV3_COMMIT = "c5d9c657966ffeeaa9353f0cc899f18629da4a13"
-EXLLAMAV3_VERSION = "0.0.43"
+EXLLAMAV3_COMMIT = "0740edc2da569fb99174023c1d2988b1e98cb41e"
+EXLLAMAV3_VERSION = "1.5.0"
 MCG_MULTIPLIER = 0xCBAC1FED
 MCG_MARKER_SIGNED_INT32 = -877912083
 # [dense-exl3] mul1 codebook marker (0x83DCD12D as signed int32) — the
@@ -163,6 +163,108 @@ _EXL3_FAT_DIAG: dict[str, Any] = {
 }
 _FAT_SCRATCH_BYTES: dict[tuple, int] = {}
 _exl3_fat_tier_logged = False
+# Deterministic combine (EXL3_MOE_FUSED_DET): one fp32 slot per routed
+# assignment, [tokens * top_k, hidden], summed per token in top-k order by
+# exllamav3_ext.exl3_moe_gather. Persistent and grown once like the grouped
+# scratch; a replaced buffer is kept alive because captured CUDA graphs may
+# still point at it.
+_DET_SLOT_CACHE: dict[tuple, torch.Tensor] = {}
+_DET_SLOT_RETIRED: list[torch.Tensor] = []
+_EXL3_DET_DIAG: dict[str, Any] = {
+    "slot_scratch_allocs": 0,
+    "slot_scratch_bytes": 0,
+    "gather_calls": 0,
+}
+_EXL3_MOE_V15_CHECKED: list[bool] = []
+
+
+def fused_det_enabled() -> bool:
+    """Deterministic MoE combine (default ON, upstream EXL3_MOE_FUSED_DET).
+
+    Every routed (token, k) contribution of the fused exl3_moe kernel (and,
+    in the grouped tier, of the fat-expert down kernel) is stored in its own
+    fp32 slot and exl3_moe_gather adds each token's slots in top-k order, so
+    identical inputs give bit-identical outputs. EXL3_MOE_FUSED_DET=0
+    restores the arrival-order atomic adds of the stock kit.
+    """
+    return os.environ.get("EXL3_MOE_FUSED_DET", "1") != "0"
+
+
+def _det_slot_rows_configured(topk: int) -> int:
+    raw = os.environ.get(
+        "EXL3_DET_SLOT_TOKENS", os.environ.get("MAX_NUM_BATCHED_TOKENS", "0")
+    )
+    return int(raw or 0) * int(topk)
+
+
+def _det_slot_scratch(
+    device: torch.device, rows: int, hidden: int, topk: int
+) -> torch.Tensor:
+    """[rows, hidden] fp32 view of the persistent slot scratch.
+
+    Sized on first use to MAX_NUM_BATCHED_TOKENS x top_k rows (the largest
+    prefill chunk), so the profile run / first prefill allocates it once and
+    vLLM's memory profile sees it. Cost per rank: hidden * 4 B per slot,
+    e.g. 4096 hidden x 8 top-k x 7168 tokens = 896 MiB.
+    """
+    key = (str(device), int(hidden))
+    buf = _DET_SLOT_CACHE.get(key)
+    if buf is not None and int(buf.shape[0]) >= rows:
+        return buf[:rows]
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "EXL3 deterministic slot scratch growth during CUDA graph capture; "
+            f"warm the largest shape first (need {rows} rows)"
+        )
+    capacity = max(256, int(rows), _det_slot_rows_configured(topk))
+    if buf is not None:
+        _DET_SLOT_RETIRED.append(buf)
+        logger.warning(
+            "exl3 fused-det slot scratch grows %d -> %d rows (set "
+            "MAX_NUM_BATCHED_TOKENS so it is sized once)",
+            int(buf.shape[0]), capacity,
+        )
+    buf = torch.empty((capacity, int(hidden)), dtype=torch.float32, device=device)
+    _DET_SLOT_CACHE[key] = buf
+    _EXL3_DET_DIAG["slot_scratch_allocs"] += 1
+    _EXL3_DET_DIAG["slot_scratch_bytes"] = sum(
+        t.numel() * t.element_size() for t in _DET_SLOT_CACHE.values()
+    ) + sum(t.numel() * t.element_size() for t in _DET_SLOT_RETIRED)
+    logger.info(
+        "exl3 fused-det slot scratch: %d rows x %d fp32 = %.1f MiB on %s "
+        "(EXL3_MOE_FUSED_DET=1; total %.1f MiB)",
+        capacity, int(hidden), capacity * int(hidden) * 4 / 2**20, device,
+        _EXL3_DET_DIAG["slot_scratch_bytes"] / 2**20,
+    )
+    return buf[:rows]
+
+
+def exl3_det_diag() -> dict[str, Any]:
+    diag = dict(_EXL3_DET_DIAG)
+    diag["fused_det"] = fused_det_enabled()
+    return diag
+
+
+def _require_exl3_moe_v15(fn: Any) -> None:
+    """exllamav3 >= 1.5 exl3_moe takes 35 positional args (num_active,
+    output_scratch, fused_base, count_lo, count_hi, m_tile after act_limit).
+    Fail closed on any other extension instead of a TypeError mid-prefill."""
+    if _EXL3_MOE_V15_CHECKED:
+        return
+    doc = getattr(fn, "__doc__", None) or ""
+    if "arg34" not in doc or "arg35" in doc:
+        raise RuntimeError(
+            "exllamav3_ext.exl3_moe does not have the exllamav3 v1.5 signature "
+            f"(35 args); this overlay expects exllamav3 {EXLLAMAV3_VERSION} "
+            f"({EXLLAMAV3_COMMIT[:7]}). Rebuild the image."
+        )
+    ext = load_exllamav3_ext()
+    if fused_det_enabled() and not hasattr(ext, "exl3_moe_gather"):
+        raise RuntimeError(
+            "EXL3_MOE_FUSED_DET=1 needs exllamav3_ext.exl3_moe_gather "
+            "(exllamav3 >= 1.5.0); set EXL3_MOE_FUSED_DET=0 or rebuild"
+        )
+    _EXL3_MOE_V15_CHECKED.append(True)
 
 
 def fused_moe_row_tile_enabled() -> bool:
@@ -707,6 +809,22 @@ def _install_exllamav3_namespace() -> None:
         config.__file__ = str(package_root / "model/config.py")
         config.__package__ = "exllamav3.model"
         config.Config = type("Config", (), {})
+
+        # exllamav3 >= 1.5: LinearEXL3(config=None) imports NullConfig and its
+        # forward() reads config.infer_params.no_reconstruct. The real module
+        # pulls the loader/rope stack, so stub the two names it needs with the
+        # upstream defaults (no_reconstruct=False).
+        class InferParams:
+            no_reconstruct = False
+            mgemm_K_threshold = 0
+            mgemm_n_threshold = 0
+
+        class NullConfig:
+            def __init__(self):
+                self.infer_params = InferParams()
+
+        config.InferParams = InferParams
+        config.NullConfig = NullConfig
         sys.modules[config.__name__] = config
 
 
@@ -766,18 +884,6 @@ def load_exllamav3_ext():
     import exllamav3_ext
 
     return exllamav3_ext
-
-
-def _exl3_moe_accepts_num_active(fn) -> bool:
-    try:
-        import inspect
-
-        if "num_active" in inspect.signature(fn).parameters:
-            return True
-    except (TypeError, ValueError):
-        pass
-    doc = getattr(fn, "__doc__", None) or ""
-    return "num_active" in doc or "arg29" in doc or doc.count("arg") >= 30
 
 
 def pin_exl3_expert_map(
@@ -1364,7 +1470,20 @@ def _exl3_moe_launch(
     k: int,
     limit: float,
     n_active_host: int | None,
+    slots: torch.Tensor | None = None,
+    fused_base: torch.Tensor | None = None,
 ) -> None:
+    """One exllamav3 v1.5 exl3_moe launch (35 positional args).
+
+    Experts with 1 <= count <= temps rows run here; larger ones are skipped
+    by the kernel and belong to a fat tier. With `slots`/`fused_base` (the
+    EXL3_MOE_FUSED_DET path) each assignment's weighted output is stored at
+    slots[fused_base[e] + row] instead of being atomically added to `out`.
+    num_active stays -1 (fixed group width, so the GEMM k-slicing and hence
+    the rounding never depend on how many experts are active); one 16-row
+    tile instance (m_tile 16) as before.
+    """
+    cap = int(temps[0].shape[1])
     args = (
         xh,
         out,
@@ -1395,11 +1514,14 @@ def _exl3_moe_launch(
         True,
         False,
         float(limit),
+        -1 if n_active_host is None else int(n_active_host),
+        slots,
+        fused_base,
+        1,
+        cap,
+        16,
     )
-    if n_active_host is not None:
-        fn(*args, n_active_host)
-    else:
-        fn(*args)
+    fn(*args)
 
 
 def _exl3_moe_row_tiles(
@@ -1415,11 +1537,15 @@ def _exl3_moe_row_tiles(
     limit: float,
     n_active_host: int | None,
     max_rows: int,
+    slots: torch.Tensor | None = None,
 ) -> None:
     """Launch exl3_moe once per 128-row slice of the sorted expert-token buffer.
 
     Prefill-only (host syncs). Decode never reaches here: tokens <= temp rows.
     Kernel skips experts with count > temp rows; tiles keep every expert inside temps.
+    With `slots` (deterministic mode) tile t's fused_base is the global
+    sorted offset of each expert plus t * tile, so every assignment lands in
+    the slot of its global sorted position; the caller gathers once.
     """
     n_exp = int(counts.shape[0])
     device = counts.device
@@ -1454,6 +1580,8 @@ def _exl3_moe_row_tiles(
             k,
             limit,
             n_active_host,
+            slots,
+            (prefix + row0) if slots is not None else None,
         )
 
 
@@ -1472,6 +1600,12 @@ def apply_exl3_fused_moe(
     row tiles if `EXL3_MOE_ROW_TILE=1`; otherwise fat experts use the highest
     enabled tier: kernel implies batched, batched implies sorted, then legacy.
     Decode (tokens ≤ cap) stays a single graph-safe launch.
+
+    EXL3_MOE_FUSED_DET=1 (default): the fused kernel stores each assignment's
+    weighted output in its own fp32 slot (slot = sorted position) and
+    exl3_moe_gather adds each token's slots in top-k order, replacing the
+    arrival-order atomics. Fat tiers that add per expert in a fixed order
+    (sorted/batched/E2 kernel/legacy) run after that gather.
     """
     import exllamav3_ext
 
@@ -1481,12 +1615,17 @@ def apply_exl3_fused_moe(
     temps = getattr(layer, "_exl3_fused_temps", None)
     if not ptrs or temps is None:
         raise RuntimeError("EXL3 fused pointer tables were not built after weight load")
+    if tokens == 0:
+        # exl3_moe_gather (v1.5.0) divides by the token count before its
+        # empty-batch return; never hand it an empty batch.
+        return torch.zeros(0, hidden, dtype=torch.float32, device=x2d.device)
 
     local = map_topk_to_local(ids, n_exp, expert_map)
     topk = int(ids.shape[-1])
     flat_token = torch.arange(tokens, device=x2d.device, dtype=torch.long).repeat_interleave(topk)
     flat_weight = weights.reshape(-1).to(dtype=torch.float16)
-    order = local.argsort()
+    # Stable: the within-expert row order is a pure function of the routing.
+    order = local.argsort(stable=True)
     token_sorted = flat_token[order]
     weight_sorted = flat_weight[order]
     # scatter_add stays on GPU. torch.bincount can host-stage and break CUDA graphs.
@@ -1499,11 +1638,44 @@ def apply_exl3_fused_moe(
 
     counts = expert_count[:n_exp]
     fn = exllamav3_ext.exl3_moe
+    _require_exl3_moe_v15(fn)
     # -1 = unknown active count: max-concurrency grid, no .item() host sync.
-    n_active_host = -1 if _exl3_moe_accepts_num_active(fn) else None
+    n_active_host = -1
     k = int(getattr(layer, "_exl3_k", 4))
     # Actual kernel cap is the allocated temp dim1 (env-selected at load).
     cap = int(temps[0].shape[1])
+
+    det = fused_det_enabled()
+    slots = inv_order = expert_start = None
+    if det:
+        n_assign = int(local.numel())
+        slots = _det_slot_scratch(x2d.device, n_assign, hidden, topk)
+        inv_order = torch.empty_like(order).scatter_(
+            0, order, torch.arange(n_assign, device=order.device, dtype=order.dtype)
+        )
+        # Slot of assignment a = expert_start[e] + (inv_order[a] - expert_start[e])
+        # = its sorted position; the kernel writes fused_base[e] + row = the same.
+        expert_start = torch.cumsum(expert_count, 0) - expert_count
+
+    def gather(kind: torch.Tensor) -> None:
+        # Sum each token's slots of the experts flagged in `kind` in top-k
+        # order and add the sum to out (one launch, no atomics). The
+        # sentinel bucket (n_exp) is never flagged.
+        exllamav3_ext.exl3_moe_gather(
+            out, slots, local, inv_order,
+            expert_start[:n_exp], expert_start[:n_exp], kind, weight_sorted,
+        )
+        _EXL3_DET_DIAG["gather_calls"] += 1
+
+    def launch_thin() -> None:
+        _exl3_moe_launch(
+            fn, xh, out, expert_count, token_sorted, weight_sorted,
+            temps, ptrs, k, limit, n_active_host, slots, expert_start,
+        )
+        if det:
+            # Only experts the fused kernel ran (1 <= count <= cap) own
+            # written slots here; fat experts are added by a later tier.
+            gather(((counts > 0) & (counts <= cap)).long())
 
     # Reset per call so a "kernel" label from an earlier prefill cannot
     # masquerade through later decode/thin/row-tile calls.
@@ -1511,10 +1683,7 @@ def apply_exl3_fused_moe(
     layer._exl3_last_fat_reason = "no_fat_experts"
 
     if tokens <= cap:
-        _exl3_moe_launch(
-            fn, xh, out, expert_count, token_sorted, weight_sorted,
-            temps, ptrs, k, limit, n_active_host,
-        )
+        launch_thin()
         return out
 
     # Prefill larger than temps. E1 copies routing counts on a side stream and
@@ -1530,10 +1699,7 @@ def apply_exl3_fused_moe(
         # E3: thin experts in the fused kernel (it skips count > cap), every
         # fat expert in three grouped launches driven by device-side tables.
         # No host sync, so this branch is CUDA-graph capturable.
-        _exl3_moe_launch(
-            fn, xh, out, expert_count, token_sorted, weight_sorted,
-            temps, ptrs, k, limit, n_active_host,
-        )
+        launch_thin()
         apply_exl3_grouped_fat(
             xh, out, counts, token_sorted, weight_sorted, layer, cap, limit
         )
@@ -1553,10 +1719,7 @@ def apply_exl3_fused_moe(
     counts_host = None
     if use_batched_fat and not use_row_tiles:
         counts_cpu, count_stream = _stage_counts_to_host(counts)
-        _exl3_moe_launch(
-            fn, xh, out, expert_count, token_sorted, weight_sorted,
-            temps, ptrs, k, limit, n_active_host,
-        )
+        launch_thin()
         launched = True
         count_stream.synchronize()
         counts_host = counts_cpu.tolist()
@@ -1576,10 +1739,7 @@ def apply_exl3_fused_moe(
         _EXL3_FAT_DIAG["thin_calls"] += 1
         _record_exl3_fat_reason("thin_only")
         if not launched:
-            _exl3_moe_launch(
-                fn, xh, out, expert_count, token_sorted, weight_sorted,
-                temps, ptrs, k, limit, n_active_host,
-            )
+            launch_thin()
         return out
 
     if use_row_tiles:
@@ -1589,15 +1749,15 @@ def apply_exl3_fused_moe(
         _record_exl3_fat_reason("row_tile_preempts_fat")
         _exl3_moe_row_tiles(
             fn, xh, out, counts, token_sorted, weight_sorted,
-            temps, ptrs, k, limit, n_active_host, max_rows,
+            temps, ptrs, k, limit, n_active_host, max_rows, slots,
         )
+        if det:
+            # The tiles covered every row of every expert.
+            gather((counts > 0).long())
         return out
 
     if not launched:
-        _exl3_moe_launch(
-            fn, xh, out, expert_count, token_sorted, weight_sorted,
-            temps, ptrs, k, limit, n_active_host,
-        )
+        launch_thin()
     if use_batched_fat:
         if use_fat_kernel:
             _record_exl3_fat_tier(layer, "kernel", "kernel_ok")

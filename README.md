@@ -402,9 +402,11 @@ same path as the compact-64 fp8 serve (not NVFP4 KV).
 | Vision | on (`LANGUAGE_MODEL_ONLY=0`) — image + video, `--limit-mm-per-prompt {image:48,video:1}`, `--mm-processor-kwargs {max_image_tokens:2048}`, `--mm-processor-cache-gb 1`, `--skip-mm-profiling`. Stateless chat clients resend every image each turn, so once a session holds more images than this ceiling, later turns are rejected — see `docs/images-per-request.md` |
 | Ablit | **off** (`ABLIT=0`). Stock `o_proj`. Set `ABLIT=1` to enable; see [Abliteration](#abliteration-ablit1) |
 
-Kernels: `TORCH_CUDA_ARCH_LIST=12.1a`. ExLlamaV3 pin `c5d9c657` (0.0.43) exposes
-`exl3_moe` / `exl3_moe_max_concurrency`; aarch64 CPU allreduce stubs in
-`overlay/patch_exl3_ext_aarch64.py`.
+Kernels: `TORCH_CUDA_ARCH_LIST=12.1a`. ExLlamaV3 pin `0740edc2` (v1.5.0, deterministic
+variant) exposes `exl3_moe` (35-arg v1.5 signature) / `exl3_moe_gather` /
+`exl3_moe_max_concurrency`; upstream's aarch64 guard (181eea1) is applied by
+`overlay/patch_exl3_ext_aarch64.py`. `EXL3_MOE_FUSED_DET=1` (default) replaces
+the atomic routed-expert combine with per-slot fp32 storage and a fixed-order sum.
 
 ## Abliteration (`ABLIT=1`)
 

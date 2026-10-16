@@ -923,6 +923,25 @@ def map_topk_to_local(
     return torch.where(invalid, flat.new_full(flat.shape, n_local), mapped)
 
 
+def _index_add_expert_rows_(
+    out: torch.Tensor, token_idx: torch.Tensor, rows: torch.Tensor
+) -> None:
+    """out[token_idx[i]] += rows[i] for ONE expert's routed rows.
+
+    Every caller passes a single expert's token list (a slice of the
+    expert-sorted assignments, or the nonzero() of ids == expert), and the
+    router never sends a token to the same expert twice, so the index has no
+    repeats: each output element receives exactly one add per call and the
+    result does not depend on thread scheduling. Callers iterate experts in
+    ascending id on one stream, so the per-token addition order is fixed too.
+    This is upstream's deterministic ordering (exllamav3 d5d56bd, "one
+    index_add_ per expert"); the order-dependent combines were the fused
+    kernel's and the grouped down kernel's atomics, replaced by the slot +
+    exl3_moe_gather path under EXL3_MOE_FUSED_DET.
+    """
+    out.index_add_(0, token_idx, rows)
+
+
 def apply_exl3_python_loop(
     x2d: torch.Tensor,
     ids: torch.Tensor,
@@ -961,7 +980,7 @@ def apply_exl3_python_loop(
         act = F.silu(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
         down = pack["down"].forward(act.contiguous().half(), {}, out_dtype=torch.float32)
         scale = weights[token_idx, k_pos].unsqueeze(-1).to(dtype=torch.float32)
-        out.index_add_(0, token_idx, down * scale)
+        _index_add_expert_rows_(out, token_idx, down * scale)
     return out
 
 def apply_exl3_sorted_fat(
@@ -998,7 +1017,7 @@ def apply_exl3_sorted_fat(
             act.contiguous().half(), {}, out_dtype=torch.float32
         )
         scale = weight_sorted[start:offset].unsqueeze(-1).to(dtype=torch.float32)
-        out.index_add_(0, token_idx, down * scale)
+        _index_add_expert_rows_(out, token_idx, down * scale)
     return out
 
 
@@ -1194,7 +1213,7 @@ def apply_exl3_batched_fat(
             ext.hgemm(h2, w2, down_out)
             ext.had_r_128(down_out, down_out, None, down.svh, 1.0)
             down_out.mul_(weight_sorted[start:offset].unsqueeze(-1))
-            out.index_add_(0, token_idx, down_out)
+            _index_add_expert_rows_(out, token_idx, down_out)
     return out
 
 
@@ -1292,6 +1311,10 @@ def build_grouped_fat_tables(
         "row_expert": re.to(torch.int32),
         "row_token": token_sorted.index_select(0, src),
         "row_weight": weight_sorted.index_select(0, src),
+        # Position of each fat row in the expert-sorted assignment list: the
+        # deterministic slot exl3_fat_moe_down_slots stores it to (dead rows
+        # past num_rows clamp to rows_cap - 1 and are never written).
+        "row_slot": src,
     }
 
 
@@ -1304,11 +1327,24 @@ def apply_exl3_grouped_fat(
     layer: torch.nn.Module,
     cap: int,
     limit: float,
+    slots: torch.Tensor | None = None,
 ) -> None:
-    """E3: every fat expert of the layer in three launches, no host sync."""
+    """E3: every fat expert of the layer in three launches, no host sync.
+
+    Without `slots` the down kernel adds w * expert_out into `out` with
+    vector atomics (arrival order). With `slots` (EXL3_MOE_FUSED_DET) it
+    stores each fat row into slots[sorted position] instead and leaves the
+    combine to the caller's exl3_moe_gather.
+    """
     ext = load_fat_moe_ext()
     if ext is None:
         raise RuntimeError("EXL3 grouped tier selected but the E3 kernels are not loaded")
+    if slots is not None and not hasattr(ext, "exl3_fat_moe_down_slots"):
+        raise RuntimeError(
+            "EXL3_MOE_FUSED_DET=1 with EXL3_FAT_GROUPED=1 needs "
+            "exl3_fat_moe_down_slots (overlay/exl3_fat_moe.cu from the "
+            "deterministic variant); rebuild, or set EXL3_MOE_FUSED_DET=0"
+        )
     ptrs = layer._exl3_ptrs
     device = ptrs["gate_trellis"].device
     if xh.device != device or out.device != device or counts.device != device:
@@ -1354,18 +1390,32 @@ def apply_exl3_grouped_fat(
         tg["num_segs"],
         float(limit),
     )
-    ext.exl3_fat_moe_down(
-        h2,
-        ptrs["down_trellis"],
-        ptrs["down_svh"],
-        out,
-        td["row_token"],
-        td["row_weight"],
-        td["seg_expert"],
-        td["seg_row0"],
-        td["seg_rows"],
-        td["num_segs"],
-    )
+    if slots is not None:
+        ext.exl3_fat_moe_down_slots(
+            h2,
+            ptrs["down_trellis"],
+            ptrs["down_svh"],
+            slots,
+            td["row_slot"],
+            td["row_weight"],
+            td["seg_expert"],
+            td["seg_row0"],
+            td["seg_rows"],
+            td["num_segs"],
+        )
+    else:
+        ext.exl3_fat_moe_down(
+            h2,
+            ptrs["down_trellis"],
+            ptrs["down_svh"],
+            out,
+            td["row_token"],
+            td["row_weight"],
+            td["seg_expert"],
+            td["seg_row0"],
+            td["seg_rows"],
+            td["num_segs"],
+        )
     _EXL3_FAT_DIAG["grouped_calls"] += 1
 
 
@@ -1667,12 +1717,12 @@ def apply_exl3_fused_moe(
         )
         _EXL3_DET_DIAG["gather_calls"] += 1
 
-    def launch_thin() -> None:
+    def launch_thin(gather_now: bool = True) -> None:
         _exl3_moe_launch(
             fn, xh, out, expert_count, token_sorted, weight_sorted,
             temps, ptrs, k, limit, n_active_host, slots, expert_start,
         )
-        if det:
+        if det and gather_now:
             # Only experts the fused kernel ran (1 <= count <= cap) own
             # written slots here; fat experts are added by a later tier.
             gather(((counts > 0) & (counts <= cap)).long())
@@ -1699,10 +1749,16 @@ def apply_exl3_fused_moe(
         # E3: thin experts in the fused kernel (it skips count > cap), every
         # fat expert in three grouped launches driven by device-side tables.
         # No host sync, so this branch is CUDA-graph capturable.
-        launch_thin()
+        # Deterministic: thin rows (fused kernel) and fat rows (grouped down
+        # kernel) both land in their sorted-position slot, then one gather
+        # sums every token's top-k slots in k order, whatever tier ran them.
+        launch_thin(gather_now=False)
         apply_exl3_grouped_fat(
-            xh, out, counts, token_sorted, weight_sorted, layer, cap, limit
+            xh, out, counts, token_sorted, weight_sorted, layer, cap, limit,
+            slots=slots,
         )
+        if det:
+            gather((counts > 0).long())
         _record_exl3_fat_tier(layer, "grouped", "grouped_ok")
         if fat_expert_log_enabled():
             record_exl3_fat_expert_stats(counts)

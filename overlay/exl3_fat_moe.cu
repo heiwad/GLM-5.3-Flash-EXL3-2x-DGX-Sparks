@@ -384,16 +384,27 @@ void fm_gateup_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// down GEMM + output Hadamard + route weight + scatter-add
+// down GEMM + output Hadamard + route weight + scatter-add (kSlots = false)
+// or per-row slot store (kSlots = true)
+//
+// Each (fat row, 4-column group) is produced by exactly one lane of one CTA
+// (no split-K), so the only cross-thread combine is the final add into the
+// token row. kSlots = false keeps the 16 B vector atomics: a token routed to
+// several fat experts receives its contributions in arrival order, which is
+// not bit-reproducible. kSlots = true writes w * expert_out of fat row r to
+// row row_dst[r] of an fp32 slot buffer with a plain store (row_dst = the
+// row's position in the expert-sorted assignment list, unique per row);
+// exllamav3_ext.exl3_moe_gather then sums each token's top-k slots in k order.
 // ---------------------------------------------------------------------------
 
+template <bool kSlots>
 __global__ __launch_bounds__(FM_THREADS, 2)
 void fm_down_kernel(
     const half* __restrict__ h2,
     const uint16_t* const* __restrict__ down_ptrs,
     const half* const* __restrict__ down_svh_ptrs,
     float* __restrict__ out,
-    const int64_t* __restrict__ row_token,
+    const int64_t* __restrict__ row_dst,   // token row (atomic) or slot row (kSlots)
     const half* __restrict__ row_weight,
     const int* __restrict__ seg_expert,
     const int* __restrict__ seg_row0,
@@ -443,7 +454,7 @@ void fm_down_kernel(
                     const float* srow = sh_c + r * TILE_N2;
                     int frow = row0 + mb * 16 + r;
                     float w = __half2float(row_weight[frow]);
-                    float* dst = out + row_token[frow] * (int64_t) size_n + n_base + lane * 4;
+                    float* dst = out + row_dst[frow] * (int64_t) size_n + n_base + lane * 4;
                     #pragma unroll
                     for (int s = 0; s < NS; ++s)
                     {
@@ -451,9 +462,17 @@ void fm_down_kernel(
                         fm_had_row(v, lane);
                         fm_mul_half4(v, svh + s * FM_TILE_N + lane * 4);
                         v.x *= w; v.y *= w; v.z *= w; v.w *= w;
-                        // Lane-contiguous 16 B vector atomics (sm_90+): one
-                        // red.v4 per lane covers the warp's 512 B row span.
-                        atomicAdd(reinterpret_cast<float4*>(dst + s * FM_TILE_N), v);
+                        if constexpr (kSlots)
+                        {
+                            // Sole writer of this slot row/column group.
+                            *reinterpret_cast<float4*>(dst + s * FM_TILE_N) = v;
+                        }
+                        else
+                        {
+                            // Lane-contiguous 16 B vector atomics (sm_90+): one
+                            // red.v4 per lane covers the warp's 512 B row span.
+                            atomicAdd(reinterpret_cast<float4*>(dst + s * FM_TILE_N), v);
+                        }
                     }
                 }
             }
@@ -487,7 +506,7 @@ int fm_grid_y(int64_t max_segs)
     return (int) g;
 }
 
-bool fm_attr_set[2] = { false, false };
+bool fm_attr_set[3] = { false, false, false };
 
 }  // namespace
 
@@ -596,6 +615,78 @@ void exl3_fat_moe_gateup(
     cuda_check(cudaPeekAtLastError());
 }
 
+namespace {
+
+template <bool kSlots>
+void fm_down_launch(
+    at::Tensor h2,
+    at::Tensor down_ptrs,
+    at::Tensor down_svh_ptrs,
+    at::Tensor out,
+    at::Tensor row_dst,
+    at::Tensor row_weight,
+    at::Tensor seg_expert,
+    at::Tensor seg_row0,
+    at::Tensor seg_rows,
+    at::Tensor num_segs)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(h2.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK(h2.is_cuda() && h2.is_contiguous() && h2.scalar_type() == at::kHalf && h2.dim() == 2,
+                "h2 must be a contiguous half [rows_cap, K] CUDA tensor");
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == at::kFloat && out.dim() == 2,
+                kSlots ? "slots must be a contiguous float [n_slots, N] CUDA tensor"
+                       : "out must be a contiguous float [tokens, N] CUDA tensor");
+    int size_k = (int) h2.size(1);
+    int size_n = (int) out.size(1);
+    TORCH_CHECK(size_k % FM_TILE_K == 0 && size_k >= FM_TILE_K, "K must be a multiple of 32");
+    TORCH_CHECK(size_n % FM_TILE_N == 0, "N must be a multiple of 128");
+    TORCH_CHECK(row_dst.is_cuda() && row_dst.scalar_type() == at::kLong && row_dst.is_contiguous()
+                && row_dst.size(0) >= h2.size(0),
+                kSlots ? "row_slot must be int64[rows_cap]" : "row_token must be int64[rows_cap]");
+    TORCH_CHECK(row_weight.is_cuda() && row_weight.scalar_type() == at::kHalf && row_weight.is_contiguous()
+                && row_weight.size(0) >= h2.size(0), "row_weight must be half[rows_cap]");
+    if constexpr (kSlots)
+    {
+        // Slots are indexed by expert-sorted assignment position, < rows_cap.
+        TORCH_CHECK(out.size(0) >= h2.size(0), "slots must have at least rows_cap rows");
+    }
+    check_ptr_table(down_ptrs, "down_ptrs", 1);
+    check_ptr_table(down_svh_ptrs, "down_svh_ptrs", down_ptrs.size(0));
+    check_seg(seg_expert, "seg_expert");
+    check_seg(seg_row0, "seg_row0");
+    check_seg(seg_rows, "seg_rows");
+    check_seg(num_segs, "num_segs");
+    TORCH_CHECK(seg_row0.size(0) == seg_expert.size(0) && seg_rows.size(0) == seg_expert.size(0),
+                "segment tables must share a length");
+
+    TORCH_CHECK(size_n % (2 * FM_TILE_N) == 0, "N must be a multiple of 256");
+    constexpr int smem = fm_smem_bytes<FM_MB_DOWN, 2>();
+    constexpr int attr = kSlots ? 2 : 1;
+    if (!fm_attr_set[attr])
+    {
+        cudaFuncSetAttribute(fm_down_kernel<kSlots>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        fm_attr_set[attr] = true;
+    }
+    dim3 grid(size_n / (2 * FM_TILE_N), fm_grid_y(seg_expert.size(0)));
+    fm_down_kernel<kSlots><<<grid, FM_THREADS, smem, stream>>>(
+        reinterpret_cast<const half*>(h2.data_ptr()),
+        reinterpret_cast<const uint16_t* const*>(down_ptrs.data_ptr()),
+        reinterpret_cast<const half* const*>(down_svh_ptrs.data_ptr()),
+        reinterpret_cast<float*>(out.data_ptr()),
+        reinterpret_cast<const int64_t*>(row_dst.data_ptr()),
+        reinterpret_cast<const half*>(row_weight.data_ptr()),
+        reinterpret_cast<const int*>(seg_expert.data_ptr()),
+        reinterpret_cast<const int*>(seg_row0.data_ptr()),
+        reinterpret_cast<const int*>(seg_rows.data_ptr()),
+        reinterpret_cast<const int*>(num_segs.data_ptr()),
+        size_k,
+        size_n);
+    cuda_check(cudaPeekAtLastError());
+}
+
+}  // namespace
+
 void exl3_fat_moe_down(
     at::Tensor h2,
     at::Tensor down_ptrs,
@@ -608,49 +699,22 @@ void exl3_fat_moe_down(
     at::Tensor seg_rows,
     at::Tensor num_segs)
 {
-    const at::cuda::OptionalCUDAGuard device_guard(h2.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    TORCH_CHECK(h2.is_cuda() && h2.is_contiguous() && h2.scalar_type() == at::kHalf && h2.dim() == 2,
-                "h2 must be a contiguous half [rows_cap, K] CUDA tensor");
-    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.scalar_type() == at::kFloat && out.dim() == 2,
-                "out must be a contiguous float [tokens, N] CUDA tensor");
-    int size_k = (int) h2.size(1);
-    int size_n = (int) out.size(1);
-    TORCH_CHECK(size_k % FM_TILE_K == 0 && size_k >= FM_TILE_K, "K must be a multiple of 32");
-    TORCH_CHECK(size_n % FM_TILE_N == 0, "N must be a multiple of 128");
-    TORCH_CHECK(row_token.is_cuda() && row_token.scalar_type() == at::kLong && row_token.is_contiguous()
-                && row_token.size(0) >= h2.size(0), "row_token must be int64[rows_cap]");
-    TORCH_CHECK(row_weight.is_cuda() && row_weight.scalar_type() == at::kHalf && row_weight.is_contiguous()
-                && row_weight.size(0) >= h2.size(0), "row_weight must be half[rows_cap]");
-    check_ptr_table(down_ptrs, "down_ptrs", 1);
-    check_ptr_table(down_svh_ptrs, "down_svh_ptrs", down_ptrs.size(0));
-    check_seg(seg_expert, "seg_expert");
-    check_seg(seg_row0, "seg_row0");
-    check_seg(seg_rows, "seg_rows");
-    check_seg(num_segs, "num_segs");
-    TORCH_CHECK(seg_row0.size(0) == seg_expert.size(0) && seg_rows.size(0) == seg_expert.size(0),
-                "segment tables must share a length");
+    fm_down_launch<false>(h2, down_ptrs, down_svh_ptrs, out, row_token, row_weight,
+                          seg_expert, seg_row0, seg_rows, num_segs);
+}
 
-    TORCH_CHECK(size_n % (2 * FM_TILE_N) == 0, "N must be a multiple of 256");
-    constexpr int smem = fm_smem_bytes<FM_MB_DOWN, 2>();
-    if (!fm_attr_set[1])
-    {
-        cudaFuncSetAttribute(fm_down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        fm_attr_set[1] = true;
-    }
-    dim3 grid(size_n / (2 * FM_TILE_N), fm_grid_y(seg_expert.size(0)));
-    fm_down_kernel<<<grid, FM_THREADS, smem, stream>>>(
-        reinterpret_cast<const half*>(h2.data_ptr()),
-        reinterpret_cast<const uint16_t* const*>(down_ptrs.data_ptr()),
-        reinterpret_cast<const half* const*>(down_svh_ptrs.data_ptr()),
-        reinterpret_cast<float*>(out.data_ptr()),
-        reinterpret_cast<const int64_t*>(row_token.data_ptr()),
-        reinterpret_cast<const half*>(row_weight.data_ptr()),
-        reinterpret_cast<const int*>(seg_expert.data_ptr()),
-        reinterpret_cast<const int*>(seg_row0.data_ptr()),
-        reinterpret_cast<const int*>(seg_rows.data_ptr()),
-        reinterpret_cast<const int*>(num_segs.data_ptr()),
-        size_k,
-        size_n);
-    cuda_check(cudaPeekAtLastError());
+void exl3_fat_moe_down_slots(
+    at::Tensor h2,
+    at::Tensor down_ptrs,
+    at::Tensor down_svh_ptrs,
+    at::Tensor slots,
+    at::Tensor row_slot,
+    at::Tensor row_weight,
+    at::Tensor seg_expert,
+    at::Tensor seg_row0,
+    at::Tensor seg_rows,
+    at::Tensor num_segs)
+{
+    fm_down_launch<true>(h2, down_ptrs, down_svh_ptrs, slots, row_slot, row_weight,
+                         seg_expert, seg_row0, seg_rows, num_segs);
 }

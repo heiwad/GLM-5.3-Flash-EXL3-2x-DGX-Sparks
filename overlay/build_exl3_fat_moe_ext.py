@@ -33,6 +33,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("exl3_fat_moe_gather", &exl3_fat_moe_gather, "exl3_fat_moe_gather");
     m.def("exl3_fat_moe_gateup", &exl3_fat_moe_gateup, "exl3_fat_moe_gateup");
     m.def("exl3_fat_moe_down", &exl3_fat_moe_down, "exl3_fat_moe_down");
+    m.def("exl3_fat_moe_down_slots", &exl3_fat_moe_down_slots, "exl3_fat_moe_down_slots");
     m.def("exl3_fat_moe_tile_rows_gateup", &exl3_fat_moe_tile_rows_gateup, "exl3_fat_moe_tile_rows_gateup");
     m.def("exl3_fat_moe_tile_rows_down", &exl3_fat_moe_tile_rows_down, "exl3_fat_moe_tile_rows_down");
 }

@@ -51,6 +51,7 @@ def main() -> int:
         '    m.def("exl3_fat_moe_gather", &exl3_fat_moe_gather, "exl3_fat_moe_gather");\n'
         '    m.def("exl3_fat_moe_gateup", &exl3_fat_moe_gateup, "exl3_fat_moe_gateup");\n'
         '    m.def("exl3_fat_moe_down", &exl3_fat_moe_down, "exl3_fat_moe_down");\n'
+        '    m.def("exl3_fat_moe_down_slots", &exl3_fat_moe_down_slots, "exl3_fat_moe_down_slots");\n'
         '    m.def("exl3_fat_moe_tile_rows_gateup", &exl3_fat_moe_tile_rows_gateup, "exl3_fat_moe_tile_rows_gateup");\n'
         '    m.def("exl3_fat_moe_tile_rows_down", &exl3_fat_moe_tile_rows_down, "exl3_fat_moe_tile_rows_down");',
     )

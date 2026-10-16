@@ -906,6 +906,8 @@ def _check_grouped_tables(device) -> None:
             assert torch.equal(tb["row_token"][:nr], exp_tok), (name, tile)
             exp_w = weight_sorted[torch.tensor(row_src, dtype=torch.long, device=device)] if row_src else weight_sorted[:0]
             assert torch.equal(tb["row_weight"][:nr], exp_w), (name, tile)
+            # Deterministic slot of each fat row = its sorted position.
+            assert tb["row_slot"][:nr].tolist() == row_src, (name, tile)
             # No fat row may point at a sentinel route (they sort last).
             assert all(src < sum(counts) for src in row_src)
             assert int(tb["seg_expert"].numel()) >= ns and int(tb["row_token"].numel()) == rows_cap
@@ -1091,6 +1093,9 @@ def _check_grouped_fat(device) -> None:
         y_e3b = apply_exl3_experts(x, ids, w, layer, fused=True)
         e3 = _err_stats(y_loop, y_e3)
         e3_rep = _err_stats(y_e3, y_e3b)
+        if exl3mod.fused_det_enabled():
+            # Thin + fat rows in slots, one top-k-ordered gather: bit-identical.
+            assert torch.equal(y_e3, y_e3b), ("E3 repeat not bit-identical under EXL3_MOE_FUSED_DET", e3_rep)
         e3_vs_e2 = _err_stats(y_e2, y_e3)
         results["mixed"] = {"e2_vs_loop": e2, "e2_repeat": e2_rep, "e3_vs_loop": e3, "e3_repeat": e3_rep, "e3_vs_e2": e3_vs_e2}
         _assert_e3_within("mixed", e2, e3)

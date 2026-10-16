@@ -11,6 +11,8 @@
 //   exl3_fat_moe_gather   : h13[row] = had128(x[token[row]] * gate_suh[expert[row]])
 //   exl3_fat_moe_gateup   : h2 = had128(silu(clamp(had(g)*svh_g)) * clamp(had(u)*svh_u) * down_suh)
 //   exl3_fat_moe_down     : out[token] += had128(h2 @ W_down) * svh_d * route_weight
+//   exl3_fat_moe_down_slots: slots[row_slot[row]] = had128(h2 @ W_down) * svh_d * route_weight
+//                           (plain store, deterministic; summed by exl3_moe_gather)
 //
 // Segment tables (int32, device): seg_expert / seg_row0 / seg_rows describe
 // row tiles of the fat-row buffer (rows are grouped by expert, expert order).
@@ -45,6 +47,22 @@ void exl3_fat_moe_down(
     at::Tensor down_svh_ptrs,
     at::Tensor out,          // [tokens, N] float (accumulated)
     at::Tensor row_token,    // [rows_cap] int64
+    at::Tensor row_weight,   // [rows_cap] half
+    at::Tensor seg_expert,
+    at::Tensor seg_row0,
+    at::Tensor seg_rows,
+    at::Tensor num_segs);
+
+// Same as exl3_fat_moe_down, but each fat row's weighted output is stored
+// (not added) at row row_slot[row] of an fp32 slot buffer. row_slot must be
+// unique per live row; the overlay passes each row's position in the
+// expert-sorted assignment list, the slot exllamav3's exl3_moe_gather reads.
+void exl3_fat_moe_down_slots(
+    at::Tensor h2,           // [rows_cap, K] half
+    at::Tensor down_ptrs,    // trellis pointers (K/16, N/16, 64)
+    at::Tensor down_svh_ptrs,
+    at::Tensor slots,        // [>= rows_cap, N] float (stored, not accumulated)
+    at::Tensor row_slot,     // [rows_cap] int64
     at::Tensor row_weight,   // [rows_cap] half
     at::Tensor seg_expert,
     at::Tensor seg_row0,

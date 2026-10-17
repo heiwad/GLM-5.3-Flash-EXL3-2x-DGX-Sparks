@@ -1060,6 +1060,10 @@ preflight() {
     [ "${avail:-0}" -ge "$need_kb" ] || warn "only $((avail/1024/1024)) GiB free on head for a ~164 GiB model"
     if [ "${NFS_SHARE:-0}" = "1" ]; then
         log "NFS_SHARE=1 — worker reads the head HF cache, no local copy to size for"
+    elif [ "${SKIP_SYNC:-0}" = "1" ]; then
+        # No copy to the worker, so nothing to size or write: its cache may be a
+        # read-only NFS view. verify_worker_model_snapshot still checks it.
+        log "SKIP_SYNC=1 — no worker copy, skipping the worker space and write checks"
     else
         avail=$(worker_ssh "df -Pk '$WORKER_HOME' 2>/dev/null" | awk 'NR==2{print $4}' || true)
         [ "${avail:-0}" -ge "$need_kb" ] || warn "only $((avail/1024/1024)) GiB free on worker for a ~164 GiB model"

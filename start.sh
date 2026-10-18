@@ -426,6 +426,9 @@ GLM53_ADAPTIVE_K_HIST="${GLM53_ADAPTIVE_K_HIST:-200}"
 # reuse); 0 = stock exl3_moe kernels. Requires an image built from a tree that
 # includes the decode-pipeline patch, otherwise model load fails closed.
 GLM53_EXL3_MOE_FAST="${GLM53_EXL3_MOE_FAST-0}"
+# Deterministic fused-MoE combine (image default 1: fp32 slots summed in top-k order).
+# 0 restores the atomic combine. Its own knob because GLM53_EXTRA_ENV refuses EXL3_* names.
+EXL3_MOE_FUSED_DET="${EXL3_MOE_FUSED_DET-1}"
 # Dense projections FP8 weight-only via Marlin (overlay/patch_dense_fp8.py). off = BF16 as shipped.
 # PROVISIONAL (changes target numerics; needs a KLD panel). Groups: shared,dense,kda,mla.
 GLM53_DENSE_FP8="${GLM53_DENSE_FP8:-off}"
@@ -802,6 +805,7 @@ validate_numeric_config() {
     fi
     _glm53_validate_dense_exl3_prefill_bf16 || return
     _glm53_validate_bool_flag GLM53_EXL3_MOE_FAST "${GLM53_EXL3_MOE_FAST-0}" || return
+    _glm53_validate_bool_flag EXL3_MOE_FUSED_DET "${EXL3_MOE_FUSED_DET-1}" || return
     _glm53_validate_bool_flag GLM53_KDA_BF16_LARGE_M "${GLM53_KDA_BF16_LARGE_M-0}" || return
     _glm53_validate_spinwait_ms || return
     _glm53_validate_bool_flag GLM53_APC_NO_STORE "${GLM53_APC_NO_STORE-1}" || return
@@ -2424,7 +2428,7 @@ launch_cluster() {
              LANGUAGE_MODEL_ONLY SKIP_MM_PROFILING \
              MM_IMAGE_TOKENS VIDEO_NUM_FRAMES MM_PROCESSOR_CACHE_GB \
              LIMIT_MM CHAT_TEMPLATE ENFORCE_EAGER EXL3_FUSED_MOE EXL3_MOE_ROW_TILE EXL3_TEMP_ROWS_FUSED \
-             EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL EXL3_FAT_GROUPED \
+             EXL3_FAT_SORTED EXL3_FAT_BATCHED EXL3_FAT_KERNEL EXL3_FAT_GROUPED EXL3_MOE_FUSED_DET \
              DEFAULT_MAX_NEW_TOKENS MODEL_DIR EXTRA_ARGS \
              ABLIT ABLIT_METHOD ABLIT_DIRECTION ABLIT_LAYERS ABLIT_ALPHA ABLIT_INCLUDE_MTP \
              GLM53_ADAPTIVE_K GLM53_ADAPTIVE_K_SET GLM53_ADAPTIVE_K_ALPHA GLM53_ADAPTIVE_K_MARGIN \
@@ -2621,6 +2625,7 @@ launch_cluster() {
         -e EXL3_FAT_BATCHED="$EXL3_FAT_BATCHED" \
         -e EXL3_FAT_KERNEL="$EXL3_FAT_KERNEL" \
         -e EXL3_FAT_GROUPED="$EXL3_FAT_GROUPED" \
+        -e EXL3_MOE_FUSED_DET="$EXL3_MOE_FUSED_DET" \
         -e ABLIT="$ABLIT" \
         -e ABLIT_METHOD="$ABLIT_METHOD" \
         -e ABLIT_DIRECTION="$ABLIT_DIRECTION" \
